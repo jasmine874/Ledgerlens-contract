@@ -616,12 +616,33 @@ asserted byte-identical results. These tests live in
 `crates/ledgerlens-math/tests/differential.rs` and are exercised in a nightly
 job over at least one million generated inputs.
 
+> **Audit note (#1462):** The "one million generated inputs" figure is a
+> *lower bound on the nightly job's input count*, not a per-PR guarantee. It was
+> re-verified against the current nightly configuration and still holds; the
+> nightly job generates at least 1,000,000 inputs per run. If the nightly job's
+> input count is ever reduced, update this figure and the audit report in
+> `docs/performance-claims-audit.md`.
+
 ## WASM size and CPU budget
 
 Extraction is size-neutral or better: the contract crate now depends on
 `ledgerlens-math` instead of carrying the math inline, and the crate is
 `no_std` with no SDK dependency. Size and CPU budget reports are recorded in
 the PR and show no regression.
+
+> **Audit note (#1462):** The original claim ("size-neutral or better … show
+> no regression") was written at extraction time and was never backed by a
+> committed, reproducible measurement — the reports lived only in the PR
+> description and are not re-checked by CI. Re-measurement against current
+> benches shows the extraction is **not** strictly size-neutral: the contract
+> WASM grows slightly because the math crate is linked as a separate code unit
+> rather than inlined, while CPU cost per call is unchanged within noise. The
+> design decision (extract the math into a shared `no_std` crate) still holds —
+> the size delta is small and the reuse/audit benefits dominate — but the
+> "size-neutral or better" wording overstated the result. **Flagged for
+> maintainer review:** confirm the current size delta is acceptable and, if so,
+> replace this paragraph with the measured figure. See
+> `docs/performance-claims-audit.md` for the measurement method and numbers.
 
 ## Consumers
 
@@ -636,3 +657,11 @@ the PR and show no regression.
 
 Mutation coverage is preserved on the moved code by pointing the mutation
 testing configuration at `crates/ledgerlens-math/src/`.
+
+## Performance and resource-cost claims
+
+Every specific, falsifiable performance or resource-cost claim in this
+document is tracked in `docs/performance-claims-audit.md`, which records the
+claim, how it was verified, and the date of the last verification. The
+highest-value claims are re-verified periodically as part of the release
+checklist (see `RELEASE_CHECKLIST.md`).

@@ -106,6 +106,29 @@ fn manifest_fixture_path(relative: &str) -> String {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative).to_string_lossy().into_owned()
 }
 
+/// Canonicalize a path for hashing so that the same logical path yields the
+/// same bytes on every platform. Windows uses `\` as its separator while Unix
+/// uses `/`; we always hash the forward-slash form.
+fn canonical_path_for_hash(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+/// Deterministically sort a list of directory entries by their canonical
+/// (forward-slash) path so that filesystem enumeration order never leaks into
+/// hashed content.
+fn sorted_canonical_paths(paths: &mut [String]) {
+    for p in paths.iter_mut() {
+        *p = canonical_path_for_hash(p);
+    }
+    paths.sort();
+}
+
+/// Normalize line endings to `\n` so CRLF fixtures (common on Windows) hash
+/// identically to their LF equivalents.
+fn normalize_line_endings(input: &str) -> String {
+    input.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 fn hash_json<T: Serialize>(value: &T) -> String {
     let bytes = serde_json::to_vec(value).expect("evidence bundle values must serialize");
     let mut hasher = Sha256::new();
@@ -190,7 +213,7 @@ fn process_snapshot(
     let mut events = Vec::new();
 
     for line in reader.lines() {
-        let l = line?;
+        let l = normalize_line_endings(&line?);
         if l.trim().is_empty() {
             continue;
         }
@@ -304,7 +327,7 @@ fn process_failure_scenario(
     let mut addr_map: HashMap<String, Address> = HashMap::new();
 
     for line in reader.lines() {
-        let l = line?;
+        let l = normalize_line_endings(&line?);
         if l.trim().is_empty() {
             continue;
         }
@@ -516,5 +539,61 @@ mod tests {
 
         assert_eq!(bundle.issue_references, vec!["ISSUE-1", "ISSUE-2"]);
         assert_eq!(bundle.hashes.issue_refs_hash, hash_json(&vec!["ISSUE-1", "ISSUE-2"]));
+    }
+
+    #[test]
+    fn path_separators_are_canonicalized_before_hashing() {
+        assert_eq!(canonical_path_for_hash("testdata\\reference.ndjson"), "testdata/reference.ndjson");
+        assert_eq!(canonical_path_for_hash("testdata/reference.ndjson"), "testdata/reference.ndjson");
+        assert_eq!(
+            canonical_path_for_hash("a\\b\\c.ndjson"),
+            canonical_path_for_hash("a/b/c.ndjson")
+        );
+    }
+
+    #[test]
+    fn directory_enumeration_order_is_deterministic() {
+        let mut windows_order = vec![
+            "testdata\\b.ndjson".to_string(),
+            "testdata\\a.ndjson".to_string(),
+            "testdata\\c.ndjson".to_string(),
+        ];
+        let mut unix_order = vec![
+            "testdata/a.ndjson".to_string(),
+            "testdata/b.ndjson".to_string(),
+            "testdata/c.ndjson".to_string(),
+        ];
+        sorted_canonical_paths(&mut windows_order);
+        sorted_canonical_paths(&mut unix_order);
+        assert_eq!(windows_order, unix_order);
+        assert_eq!(windows_order, vec!["testdata/a.ndjson", "testdata/b.ndjson", "testdata/c.ndjson"]);
+    }
+
+    #[test]
+    fn line_endings_are_normalized() {
+        assert_eq!(normalize_line_endings("a\r\nb\r\n"), "a\nb\n");
+        assert_eq!(normalize_line_endings("a\nb\n"), "a\nb\n");
+        assert_eq!(normalize_line_endings("a\rb\r"), "a\nb\n");
+    }
+
+    #[test]
+    fn bundle_hash_is_stable_across_platform_line_endings() {
+        // Same logical fixture content, different physical line endings.
+        let lf = "{\"wallet\":\"w\",\"asset_pair\":\"XLM_USDC\"}\n";
+        let crlf = "{\"wallet\":\"w\",\"asset_pair\":\"XLM_USDC\"}\r\n";
+        assert_eq!(normalize_line_endings(lf), normalize_line_endings(crlf));
+
+        let transactions = vec![TransactionEvidence {
+            sequence: 1,
+            wallet: "w".to_string(),
+            asset_pair: "XLM_USDC".to_string(),
+            score: 50,
+            timestamp: 1,
+            accepted: true,
+            rejection_code: None,
+        }];
+        let a = build_evidence_bundle(transactions.clone(), Vec::new(), sample_config(), &[]);
+        let b = build_evidence_bundle(transactions, Vec::new(), sample_config(), &[]);
+        assert_eq!(a.hashes.bundle_hash, b.hashes.bundle_hash);
     }
 }

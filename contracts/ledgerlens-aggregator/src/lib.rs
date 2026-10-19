@@ -36,7 +36,42 @@ pub enum Error {
     /// A candidate shard does not advertise every capability
     /// `REQUIRED_SHARD_CAPABILITIES` requires.
     IncompatibleInterface = 7,
+    /// The requested lifecycle transition is not legal from the shard's
+    /// current [`ShardState`] (e.g. decommissioning an already decommissioned
+    /// shard, or draining a shard that is not active).
+    InvalidShardState = 8,
+    /// A shard cannot move from `Draining` to `Decommissioned` until the
+    /// governed minimum drain duration has elapsed since it entered
+    /// `Draining`.
+    DrainPeriodNotElapsed = 9,
+    /// The emergency override that skips the drain period requires a distinct,
+    /// higher authorisation than the ordinary admin. The caller did not
+    /// satisfy it.
+    EmergencyOverrideNotAuthorized = 10,
+    /// No emergency override authority has been configured, so the emergency
+    /// path is unavailable.
+    EmergencyOverrideNotConfigured = 11,
 }
+
+/// Lifecycle state of a registered shard.
+///
+/// * `Active` — counted toward quorum for new queries and answers direct reads.
+/// * `Draining` — excluded from quorum for *new* queries but still registered,
+///   still answers direct reads, and retains its data so operators can migrate
+///   or archive its unique state. A shard may only leave `Draining` for
+///   `Decommissioned` once the governed minimum drain duration has elapsed.
+/// * `Decommissioned` — removed from the registry; no longer answers reads.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ShardState {
+    Active,
+    Draining,
+    Decommissioned,
+}
+
+/// Default minimum drain duration (in ledgers) applied when the contract is
+/// initialized. Governance may change it via `set_min_drain_duration`.
+pub const DEFAULT_MIN_DRAIN_DURATION: u32 = 17_280;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -261,29 +296,121 @@ impl LedgerLensAggregator {
         Ok(())
     }
 
+    /// Removes a shard from the registry.
+    ///
+    /// This is the final step of the governed lifecycle and refuses to skip the
+    /// drain period: the shard must already be `Draining` and the governed
+    /// minimum drain duration must have elapsed. Use
+    /// `emergency_decommission_shard` for the separately authorised override.
     pub fn remove_shard(env: Env, shard: Address) -> Result<(), Error> {
         let admin: Address =
             env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)?;
         admin.require_auth();
-        let shards: Vec<Address> =
-            env.storage().instance().get(&DataKey::Shards).unwrap_or_else(|| Vec::new(&env));
-        let mut found = false;
-        let mut out: Vec<Address> = Vec::new(&env);
-        for i in 0..shards.len() {
-            let a = shards.get(i).unwrap();
-            if a == shard {
-                found = true;
-            } else {
-                out.push_back(a);
-            }
-        }
-        if !found {
+        if !is_shard_registered(&env, &shard) {
             return Err(Error::ShardNotRegistered);
         }
-        env.storage().instance().set(&DataKey::Shards, &out);
-        env.storage().instance().remove(&DataKey::ShardHealth(shard.clone()));
-        env.storage().instance().remove(&DataKey::ShardCapabilities(shard));
+        match get_shard_state(&env, &shard) {
+            ShardState::Draining => {
+                if !drain_period_elapsed(&env, &shard) {
+                    return Err(Error::DrainPeriodNotElapsed);
+                }
+            }
+            // Active shards must be drained first; already-decommissioned
+            // shards are not registered, so this is unreachable in practice.
+            ShardState::Active | ShardState::Decommissioned => {
+                return Err(Error::InvalidShardState);
+            }
+        }
+        finalize_removal(&env, &shard);
         Ok(())
+    }
+
+    /// Begins the drain period for an `Active` shard.
+    ///
+    /// While draining the shard is excluded from quorum for new queries but
+    /// keeps answering direct reads and retains its data. The drain start
+    /// ledger is recorded so `remove_shard` can enforce the governed minimum
+    /// drain duration.
+    pub fn begin_shard_drain(env: Env, shard: Address) -> Result<(), Error> {
+        let admin: Address =
+            env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        if !is_shard_registered(&env, &shard) {
+            return Err(Error::ShardNotRegistered);
+        }
+        if get_shard_state(&env, &shard) != ShardState::Active {
+            return Err(Error::InvalidShardState);
+        }
+        set_shard_state(&env, &shard, ShardState::Draining);
+        env.storage().instance().set(&DataKey::ShardDrainStart(shard.clone()), &env.ledger().sequence());
+        env.events().publish((symbol_short!("sh_drain"), shard), env.ledger().sequence());
+        Ok(())
+    }
+
+    /// Emergency override: moves a shard straight to `Decommissioned`,
+    /// skipping the drain period.
+    ///
+    /// This requires a distinct, higher authorisation than the ordinary admin:
+    /// the configured emergency override authority must authorise the call.
+    /// If no override authority has been configured the path is unavailable.
+    pub fn emergency_decommission_shard(env: Env, shard: Address) -> Result<(), Error> {
+        let admin: Address =
+            env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        let override_authority: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::EmergencyOverride)
+            .ok_or(Error::EmergencyOverrideNotConfigured)?;
+        // Distinct, higher authorisation: the override authority must approve
+        // in addition to the admin.
+        override_authority.require_auth();
+        if !is_shard_registered(&env, &shard) {
+            return Err(Error::ShardNotRegistered);
+        }
+        set_shard_state(&env, &shard, ShardState::Decommissioned);
+        env.events().publish((symbol_short!("sh_emgdec"), shard), env.ledger().sequence());
+        finalize_removal(&env, &shard);
+        Ok(())
+    }
+
+    /// Governance: sets the emergency override authority. Requires the admin.
+    pub fn set_emergency_override(env: Env, authority: Address) -> Result<(), Error> {
+        let admin: Address =
+            env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::EmergencyOverride, &authority);
+        Ok(())
+    }
+
+    /// Governance: sets the minimum drain duration (in ledgers) that must
+    /// elapse between `begin_shard_drain` and `remove_shard`.
+    pub fn set_min_drain_duration(env: Env, duration: u32) -> Result<(), Error> {
+        let admin: Address =
+            env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::MinDrainDuration, &duration);
+        env.events().publish((symbol_short!("sh_drdur"),), duration);
+        Ok(())
+    }
+
+    /// Returns the governed minimum drain duration in ledgers.
+    pub fn get_min_drain_duration(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinDrainDuration)
+            .unwrap_or(DEFAULT_MIN_DRAIN_DURATION)
+    }
+
+    /// Returns the lifecycle state of a registered shard.
+    pub fn get_shard_state(env: Env, shard: Address) -> Result<ShardState, Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        if !is_shard_registered(&env, &shard) {
+            return Err(Error::ShardNotRegistered);
+        }
+        Ok(get_shard_state(&env, &shard))
     }
 
     pub fn get_shards(env: Env) -> Vec<Address> {
@@ -342,8 +469,10 @@ impl LedgerLensAggregator {
         if !asset_pair_is_bounded(&env, &asset_pair) {
             return false;
         }
-        let shards: Vec<Address> =
-            env.storage().instance().get(&DataKey::Shards).unwrap_or_else(|| Vec::new(&env));
+        // Snapshot the quorum-eligible membership once, at query start, so a
+        // shard transitioning to Draining mid-flight cannot retroactively
+        // change the result of a query that already committed to including it.
+        let shards = quorum_shards(&env);
         if shards.is_empty() {
             return false;
         }
@@ -375,8 +504,9 @@ impl LedgerLensAggregator {
         if !asset_pair_is_bounded(&env, &asset_pair) {
             return Err(ScoreError::InvalidAttestation);
         }
-        let shards: Vec<Address> =
-            env.storage().instance().get(&DataKey::Shards).unwrap_or_else(|| Vec::new(&env));
+        // Snapshot quorum-eligible membership at query start (see
+        // `query_risk_gate`).
+        let shards = quorum_shards(&env);
         let mut best: Option<RiskScore> = None;
         for i in 0..shards.len() {
             let shard = shards.get(i).unwrap();
@@ -412,8 +542,9 @@ impl LedgerLensAggregator {
         env: Env,
         wallet: Address,
     ) -> Result<AggregateRiskScore, ScoreError> {
-        let shards: Vec<Address> =
-            env.storage().instance().get(&DataKey::Shards).unwrap_or_else(|| Vec::new(&env));
+        // Snapshot quorum-eligible membership at query start (see
+        // `query_risk_gate`).
+        let shards = quorum_shards(&env);
         let mut best: Option<AggregateRiskScore> = None;
         for i in 0..shards.len() {
             let shard = shards.get(i).unwrap();
@@ -708,6 +839,68 @@ fn is_shard_healthy(env: &Env, shard: &Address) -> bool {
     env.storage().instance().get(&DataKey::ShardHealth(shard.clone())).unwrap_or(true)
 }
 
+/// Returns the lifecycle state of `shard`, defaulting to `Active` for shards
+/// registered before the lifecycle feature was deployed.
+fn get_shard_state(env: &Env, shard: &Address) -> ShardState {
+    env.storage()
+        .instance()
+        .get(&DataKey::ShardState(shard.clone()))
+        .unwrap_or(ShardState::Active)
+}
+
+fn set_shard_state(env: &Env, shard: &Address, state: ShardState) {
+    env.storage().instance().set(&DataKey::ShardState(shard.clone()), &state);
+}
+
+/// Returns `true` once the governed minimum drain duration has elapsed since
+/// `shard` entered `Draining`.
+fn drain_period_elapsed(env: &Env, shard: &Address) -> bool {
+    let start: u32 = match env.storage().instance().get(&DataKey::ShardDrainStart(shard.clone())) {
+        Some(start) => start,
+        None => return false,
+    };
+    let min_duration: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::MinDrainDuration)
+        .unwrap_or(DEFAULT_MIN_DRAIN_DURATION);
+    env.ledger().sequence().saturating_sub(start) >= min_duration
+}
+
+/// Removes `shard` from the registry and clears its per-shard bookkeeping.
+fn finalize_removal(env: &Env, shard: &Address) {
+    let shards: Vec<Address> =
+        env.storage().instance().get(&DataKey::Shards).unwrap_or_else(|| Vec::new(env));
+    let mut out: Vec<Address> = Vec::new(env);
+    for i in 0..shards.len() {
+        let a = shards.get(i).unwrap();
+        if a != *shard {
+            out.push_back(a);
+        }
+    }
+    env.storage().instance().set(&DataKey::Shards, &out);
+    env.storage().instance().remove(&DataKey::ShardHealth(shard.clone()));
+    env.storage().instance().remove(&DataKey::ShardCapabilities(shard.clone()));
+    env.storage().instance().remove(&DataKey::ShardState(shard.clone()));
+    env.storage().instance().remove(&DataKey::ShardDrainStart(shard.clone()));
+}
+
+/// Returns the shards eligible to count toward quorum for a *new* query:
+/// every registered shard whose lifecycle state is `Active`. Draining shards
+/// are excluded from quorum but remain registered and answer direct reads.
+fn quorum_shards(env: &Env) -> Vec<Address> {
+    let shards: Vec<Address> =
+        env.storage().instance().get(&DataKey::Shards).unwrap_or_else(|| Vec::new(env));
+    let mut out: Vec<Address> = Vec::new(env);
+    for i in 0..shards.len() {
+        let shard = shards.get(i).unwrap();
+        if get_shard_state(env, &shard) == ShardState::Active {
+            out.push_back(shard);
+        }
+    }
+    out
+}
+
 fn is_shard_registered(env: &Env, shard: &Address) -> bool {
     let shards: Vec<Address> =
         env.storage().instance().get(&DataKey::Shards).unwrap_or_else(|| Vec::new(env));
@@ -811,4 +1004,13 @@ enum DataKey {
     /// `supports_interface` when it was registered.  Used by
     /// `get_shard_capabilities` and downgrade-detection tests.
     ShardCapabilities(Address),
+    /// Lifecycle state of a registered shard (`ShardState`).
+    ShardState(Address),
+    /// Ledger sequence at which a shard entered `Draining`.
+    ShardDrainStart(Address),
+    /// Governed minimum drain duration in ledgers.
+    MinDrainDuration,
+    /// Distinct, higher-authority address required for the emergency
+    /// decommission override.
+    EmergencyOverride,
 }

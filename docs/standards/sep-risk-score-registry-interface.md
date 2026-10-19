@@ -41,6 +41,7 @@ portable core is small enough to be boring.
 | `docs/interface-versioning-policy.md` | Normative source | Defines append-only capabilities, stable error discriminants, and what counts as breaking. |
 | `contracts/reference-provider` | Reference implementation | Written for this draft; the executable form of every MUST. |
 | `tests/conformance` (`conformance_vectors.json`) | Conformance suite | Provider-neutral vectors any language can execute. |
+| `docs/standards/sep-requirement-test-mapping.md` | Coverage artifact | Checklist of every MUST in this document, mapped to the reference-provider test that verifies it. |
 | RFC 2119 | Conventions | MUST / MUST NOT / SHOULD / SHOULD NOT / MAY as in RFC 2119. |
 
 No dependency on any particular detection model, vendor, or chain extension.
@@ -114,7 +115,10 @@ produced, who may produce them, or how a provider is governed.
 
 1.2 A **provider** conforms when it implements every MUST in §3–§9 and passes the
 conformance suite in `tests/conformance/conformance_vectors.json`. The suite is
-normative; prose is not a substitute for it.
+normative; prose is not a substitute for it. The checklist of every MUST in this
+document, and the reference-provider test that verifies each one, is maintained in
+`docs/standards/sep-requirement-test-mapping.md`; a MUST added here without a
+corresponding entry there is an untested requirement.
 
 1.3 A **consumer** conforms when it follows §10. Consumer conformance is not
 tested by the suite, because it is a property of the integrating protocol.
@@ -508,6 +512,15 @@ cannot fail is worse than no suite, so the harness also carries negative
 controls — a deliberately non-conformant provider — that prove the vectors detect
 fail-open behaviour.
 
+11.6 The reference provider's own test suite is required to exercise every MUST in
+this document, not only the behaviours the conformance vectors happen to cover.
+The requirement-to-test checklist in `docs/standards/sep-requirement-test-mapping.md`
+is the durable record of that coverage: it is extracted from this document
+independently of the reference provider's test file structure, and it MUST be
+updated in the same change as any addition, removal, or rewording of a MUST here.
+A requirement with no mapped test is a coverage gap, and a test that does not
+verify the requirement as stated does not count as coverage.
+
 ### 12. Versioning of this standard
 
 12.1 This document carries a `Version` in its preamble, independent of any
@@ -690,3 +703,8 @@ governance, and MUST NOT infer it from a successful read.
   rationale in `docs/standards/ledgerlens-alignment.md`.
 - No change to the ABI, storage layout, events, or error enum of
   `contracts/ledgerlens-score`.
+- Added `docs/standards/sep-requirement-test-mapping.md`: a checklist of every
+  MUST in this document, extracted section by section, mapped to the
+  reference-provider test that verifies it. Added §11.6 requiring the reference
+  provider's suite to cover every MUST and the mapping to be updated with the
+  standard.

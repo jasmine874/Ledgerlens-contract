@@ -970,3 +970,191 @@ fn test_capability_snapshot_removed_on_shard_removal() {
     let caps = client.get_shard_capabilities(&shard_id);
     assert_eq!(caps.len(), 0, "snapshot must be cleared on shard removal");
 }
+
+// ── Issue #1464: Governed shard decommissioning lifecycle ─────────────────────
+
+/// A shard registered through the aggregator starts out `Active`.
+#[test]
+fn test_lifecycle_new_shard_is_active() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = init_aggregator(&env);
+    let (shard_id, _) = setup_score_shard(&env);
+    client.add_shard(&shard_id);
+
+    assert_eq!(client.get_shard_lifecycle(&shard_id), ShardLifecycle::Active);
+}
+
+/// Active → Draining is a governed transition and records the drain start.
+#[test]
+fn test_lifecycle_active_to_draining() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = init_aggregator(&env);
+    let (shard_id, _) = setup_score_shard(&env);
+    client.add_shard(&shard_id);
+
+    env.ledger().with_mut(|ledger| ledger.timestamp = 1_000);
+    client.begin_shard_drain(&shard_id);
+
+    assert_eq!(client.get_shard_lifecycle(&shard_id), ShardLifecycle::Draining);
+    assert_eq!(client.get_shard_drain_started_at(&shard_id), Some(1_000));
+}
+
+/// Draining → Decommissioned is only allowed once the governed minimum drain
+/// duration has elapsed. Tested at the boundary (one second short, then exact).
+#[test]
+fn test_lifecycle_draining_to_decommissioned_boundary() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = init_aggregator(&env);
+    let (shard_id, _) = setup_score_shard(&env);
+    client.add_shard(&shard_id);
+
+    let min_drain = client.get_min_drain_duration();
+    assert!(min_drain > 0, "minimum drain duration must be governed and non-zero");
+
+    env.ledger().with_mut(|ledger| ledger.timestamp = 1_000);
+    client.begin_shard_drain(&shard_id);
+
+    // One second short of the boundary: rejected.
+    env.ledger().with_mut(|ledger| ledger.timestamp = 1_000 + min_drain - 1);
+    assert_eq!(
+        client.try_complete_shard_decommission(&shard_id),
+        Err(Ok(Error::DrainPeriodNotElapsed))
+    );
+    assert_eq!(client.get_shard_lifecycle(&shard_id), ShardLifecycle::Draining);
+
+    // Exactly at the boundary: allowed.
+    env.ledger().with_mut(|ledger| ledger.timestamp = 1_000 + min_drain);
+    client.complete_shard_decommission(&shard_id);
+    assert_eq!(client.get_shard_lifecycle(&shard_id), ShardLifecycle::Decommissioned);
+}
+
+/// The minimum drain duration is governed: an admin can change it and the new
+/// value is enforced at its boundary.
+#[test]
+fn test_lifecycle_min_drain_duration_is_governed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = init_aggregator(&env);
+    let (shard_id, _) = setup_score_shard(&env);
+    client.add_shard(&shard_id);
+
+    client.set_min_drain_duration(&500);
+    assert_eq!(client.get_min_drain_duration(), 500);
+
+    env.ledger().with_mut(|ledger| ledger.timestamp = 10_000);
+    client.begin_shard_drain(&shard_id);
+
+    env.ledger().with_mut(|ledger| ledger.timestamp = 10_000 + 499);
+    assert_eq!(
+        client.try_complete_shard_decommission(&shard_id),
+        Err(Ok(Error::DrainPeriodNotElapsed))
+    );
+
+    env.ledger().with_mut(|ledger| ledger.timestamp = 10_000 + 500);
+    client.complete_shard_decommission(&shard_id);
+    assert_eq!(client.get_shard_lifecycle(&shard_id), ShardLifecycle::Decommissioned);
+}
+
+/// A shard cannot jump straight from Active to Decommissioned.
+#[test]
+fn test_lifecycle_cannot_skip_drain() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = init_aggregator(&env);
+    let (shard_id, _) = setup_score_shard(&env);
+    client.add_shard(&shard_id);
+
+    assert_eq!(
+        client.try_complete_shard_decommission(&shard_id),
+        Err(Ok(Error::InvalidLifecycleTransition))
+    );
+    assert_eq!(client.get_shard_lifecycle(&shard_id), ShardLifecycle::Active);
+}
+
+/// The emergency override path exists but requires a distinct, higher
+/// authorisation: the emergency admin, not the ordinary admin.
+#[test]
+fn test_lifecycle_emergency_override_requires_emergency_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = init_aggregator(&env);
+    let (shard_id, _) = setup_score_shard(&env);
+    client.add_shard(&shard_id);
+
+    let emergency_admin = Address::generate(&env);
+    client.set_emergency_admin(&emergency_admin);
+
+    // The ordinary admin alone cannot force-decommission.
+    assert_eq!(
+        client.try_emergency_decommission_shard(&shard_id),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // With the emergency admin's authorisation the override succeeds.
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &emergency_admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "emergency_decommission_shard",
+            args: (&shard_id,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    client.emergency_decommission_shard(&shard_id);
+    assert_eq!(client.get_shard_lifecycle(&shard_id), ShardLifecycle::Decommissioned);
+}
+
+/// A draining shard is excluded from quorum for new queries but still answers
+/// direct reads.
+#[test]
+fn test_lifecycle_draining_excluded_from_quorum_but_readable() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = init_aggregator(&env);
+    let (shard_a, _) = setup_score_shard(&env);
+    let (shard_b, _) = setup_score_shard(&env);
+    client.add_shard(&shard_a);
+    client.add_shard(&shard_b);
+
+    let wallet = Address::generate(&env);
+    let pair = symbol_short!("XLM_USDC");
+    let report = client.detect_split_brain(&wallet, &pair);
+    assert_eq!(report.required_quorum, 2);
+
+    client.begin_shard_drain(&shard_a);
+    let report = client.detect_split_brain(&wallet, &pair);
+    assert_eq!(report.required_quorum, 1, "draining shard must not count toward quorum");
+}
+
+/// A query that committed to including a shard just before it transitions to
+/// Draining must have its result unaffected by the transition completing
+/// mid-flight.
+#[test]
+fn test_lifecycle_in_flight_query_unaffected_by_transition() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = init_aggregator(&env);
+    let (shard_a, shard_a_client) = setup_score_shard(&env);
+    let (shard_b, shard_b_client) = setup_score_shard(&env);
+    client.add_shard(&shard_a);
+    client.add_shard(&shard_b);
+
+    let wallet = Address::generate(&env);
+    let pair = symbol_short!("XLM_USDC");
+    shard_a_client.submit_score(&Vec::new(&env), &wallet, &pair, &10, &false, &false, &1, &100, &1, &None);
+    shard_b_client.submit_score(&Vec::new(&env), &wallet, &pair, &90, &false, &false, &1, &100, &1, &None);
+
+    // Snapshot the result the query would produce before the transition.
+    let before = client.get_score(&wallet, &pair);
+
+    // Transition the shard mid-flight; the already-committed query result must
+    // be identical because the shard still answers direct reads while draining.
+    client.begin_shard_drain(&shard_a);
+    let after = client.get_score(&wallet, &pair);
+
+    assert_eq!(before.score, after.score);
+    assert_eq!(before.timestamp, after.timestamp);
+}

@@ -74,7 +74,86 @@ Median-absolute-deviation outlier rejection followed by a weighted mean.
 If every shard is rejected (e.g. `mad == 0` and all deviations are non-zero),
 the policy falls back to the plain median `m` rather than returning an error.
 
+## Shard Lifecycle
+
+Shards move through a governed lifecycle state machine. The state is tracked per
+shard and controls whether the shard counts toward quorum for new queries and
+whether it may be removed from the registry.
+
+### States
+
+- **`Active`** — the shard is a full participant. It counts toward quorum for
+  new queries and answers reads normally.
+- **`Draining`** — the shard is read-only. It is **excluded from quorum
+  calculations for new queries**, so it no longer contributes to the quorum
+  threshold or the shard set of queries started after the transition. It is
+  **not** removed: its data is retained and it still answers direct reads
+  (`get_score`, `get_aggregate_score` against that shard) so operators can
+  migrate or archive its unique state.
+- **`Decommissioned`** — the shard is removed from the registry and no longer
+  answers reads.
+
+### Transitions
+
+| From           | To               | Authorisation                         |
+| -------------- | ---------------- | ------------------------------------- |
+| `Active`       | `Draining`       | Admin                                 |
+| `Draining`     | `Decommissioned` | Admin, after the minimum drain period |
+| `Draining`     | `Active`         | Admin (abort a drain)                 |
+| `Active`       | `Decommissioned` | Emergency override only (see below)   |
+
+A shard cannot move from `Active` straight to `Decommissioned` through the
+normal path. The only way to skip the drain period is the explicit emergency
+override, which requires a distinct, higher authorisation than ordinary admin
+actions.
+
+### Minimum Drain Duration
+
+The minimum drain duration is **governed**, not fixed. It is set with
+`set_min_drain_duration(Env, u64) -> Result<(), ScoreError>` and read with
+`get_min_drain_duration(Env) -> u64`, expressed in seconds. It defaults to a
+non-zero value so a drain can never be completed instantly by accident.
+
+Boundary behavior:
+
+- A shard may move from `Draining` to `Decommissioned` only once
+  `now - drain_started_at >= min_drain_duration`.
+- Exactly at the boundary (`elapsed == min_drain_duration`) the transition is
+  **allowed**; one second earlier (`elapsed == min_drain_duration - 1`) it is
+  rejected with `ScoreError::DrainPeriodNotElapsed`.
+- Changing the minimum drain duration does not retroactively shorten or extend a
+  drain already in progress beyond what the elapsed time already satisfies; the
+  check is always evaluated against the current governed value at transition
+  time.
+
+### Quorum Exclusion
+
+Once a shard is `Draining`, it is excluded from quorum for **new** queries. The
+quorum threshold and the participating shard set are computed from `Active`
+shards only. This exclusion is **not retroactive**: a query that already
+committed to including the shard before the transition keeps its original shard
+set and quorum threshold for the duration of that query.
+
+### In-Flight Query Guarantee
+
+A query's result is determined by the shard set and quorum captured when the
+query started. If a shard transitions (`Active` → `Draining`, or any other
+lifecycle change) while a query is executing, that query's result is unaffected:
+it still counts the shard as it was at start time and returns the same value it
+would have returned had no transition occurred. This guarantees that no query
+mid-flight is silently dropped or altered when a shard is decommissioned.
+
+### Emergency Override
+
+The emergency override allows an `Active` shard to move directly to
+`Decommissioned`, skipping the drain period. Because this bypasses the safety
+guarantee above, it requires a **separate, higher authorisation** than ordinary
+admin actions — it is not satisfied by the normal admin key alone. The override
+must be explicitly authorised and is recorded as such; it is intended only for
+compromised or unrecoverable shards, not routine decommissioning.
+
 ## Degenerate Cases
+=======
 
 Robust statistics degenerate with very few shards. The policies are defined as
 follows so behavior is always deterministic:
@@ -180,6 +259,35 @@ exceeds `100_000`.
 
 Returns the current MAD multiplier in basis points, or `30000` if unset.
 
+### `set_min_drain_duration(Env, u64) -> Result<(), ScoreError>`
+
+Sets the governed minimum drain duration in seconds. Requires admin
+authorization. Returns `ScoreError::InvalidParameter` if the value is `0`.
+
+### `get_min_drain_duration(Env) -> u64`
+
+Returns the current minimum drain duration in seconds.
+
+### `begin_shard_drain(Env, shard) -> Result<(), ScoreError>`
+
+Moves an `Active` shard to `Draining` and records the drain start time. Requires
+admin authorization. Returns `ScoreError::InvalidShardState` if the shard is not
+`Active`.
+
+### `complete_shard_decommission(Env, shard) -> Result<(), ScoreError>`
+
+Moves a `Draining` shard to `Decommissioned`. Requires admin authorization and
+that the minimum drain duration has elapsed. Returns
+`ScoreError::DrainPeriodNotElapsed` if the drain period has not elapsed, and
+`ScoreError::InvalidShardState` if the shard is not `Draining`.
+
+### `emergency_decommission_shard(Env, shard) -> Result<(), ScoreError>`
+
+Moves an `Active` shard directly to `Decommissioned`, bypassing the drain
+period. Requires the distinct, higher emergency authorisation. Returns
+`ScoreError::Unauthorized` if that authorisation is not present.
+=======
+
 ## Example
 
 ```rust
@@ -198,4 +306,14 @@ client.set_mad_multiplier(&30000); // reject beyond 3x MAD
 
 // Switch back to HighestScore
 client.set_conflict_resolution_policy(&ConflictPolicy::HighestScore);
+
+// Govern the minimum drain duration (e.g. 24 hours)
+client.set_min_drain_duration(&86_400);
+
+// Drain a shard: it stops counting toward quorum for new queries but still
+// answers direct reads while operators migrate its state.
+client.begin_shard_drain(&shard);
+
+// After the drain period elapses, complete the decommission.
+client.complete_shard_decommission(&shard);
 ```

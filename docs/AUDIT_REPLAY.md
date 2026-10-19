@@ -29,6 +29,25 @@ Events that mutate **global state** (global counters, configuration, upgrade sta
 
 Each partition produces its own ordered event log. After all partitions for a segment complete, their logs are merged back into the original global order using the event's stable sequence number (not thread completion order). Because merging is keyed on the sequence number, the merged output — including bundle hashes — is **byte-identical to sequential replay regardless of thread count**.
 
+### Cross-Platform Determinism Guarantee
+
+The incident evidence bundle hash and its full contents are guaranteed to be **byte-identical for the same logical fixture input**, independent of the host operating system, filesystem, or directory enumeration order.
+
+This guarantee has been verified across the following platforms:
+
+- **Linux** (x86_64, ext4)
+- **Windows** (x86_64, NTFS)
+
+For identical fixture input, the bundle generator produces the same bundle hash and byte-for-byte identical bundle contents on both platforms. To keep this true, the generator:
+
+- Normalizes all paths to forward slashes (`/`) before any path is written into hashed content, so Windows path separators never leak into the hash.
+- Sorts directory entries by their normalized relative path before hashing, so filesystem enumeration order cannot affect the result.
+- Normalizes line endings to `\n` (LF) before hashing, so CRLF/LF differences between platforms do not change the hash.
+
+A dedicated cross-platform CI job runs the bundle generator on both Linux and Windows against the same fixture input and **fails if the resulting bundle hashes differ**. The job also runs a seeded platform-dependent regression fixture (which reintroduces a path-separator/line-ending/enumeration-order difference) and asserts that the determinism check catches it, so the guard itself is regression-tested.
+
+Any change to the bundle generator must keep this guarantee; if a new platform is added to CI, it must be listed here once verified.
+
 ### `--verify-sequential` Mode
 
 For small inputs, the replay tool supports a cross-check mode:

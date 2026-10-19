@@ -188,6 +188,12 @@ impl ReferenceRiskRegistry {
         model_version: u32,
     ) -> Result<(), Error> {
         Self::require_admin_auth(&env)?;
+        // A paused provider must not accept new observations: serving a score
+        // written while the circuit breaker was active would defeat the
+        // breaker, which exists precisely because the feed is untrusted.
+        if storage_paused(&env) {
+            return Err(Error::ContractPaused);
+        }
         if score > 100 {
             return Err(Error::InvalidScore);
         }
@@ -257,6 +263,10 @@ impl ReferenceRiskRegistry {
     /// `score = 30, confidence = 5` result carries almost no information and
     /// must not be read as evidence of safety.
     pub fn query_risk_gate(env: Env, subject: Address, scope: Symbol, gate_threshold: u32) -> bool {
+        // `gate_threshold == 0` is handled by the strict comparison below: no
+        // score can be strictly below zero, so it resolves to `false` without a
+        // special case. Thresholds above 100 are rejected explicitly because a
+        // conformant score can never be below them either.
         if gate_threshold > 100 {
             return false;
         }
@@ -284,6 +294,9 @@ impl ReferenceRiskRegistry {
         if gate_threshold > 100 || min_confidence > 100 {
             return false;
         }
+        // The provider-wide floor is only meaningful for an initialised,
+        // unpaused provider; `lookup` already fails closed in those cases, so
+        // reading the floor here cannot widen the gate.
         let effective_floor = core::cmp::max(min_confidence, global_min_confidence(&env));
         match Self::lookup(&env, &subject, &scope) {
             Some(risk) => risk.score < gate_threshold && risk.confidence >= effective_floor,
@@ -312,6 +325,9 @@ impl ReferenceRiskRegistry {
     /// capability, once published, is never removed or repurposed.
     pub fn supports_interface(env: Env, capability: Symbol) -> bool {
         let _ = env;
+        // MUST capabilities are unconditional: a deployment that answers
+        // `false` for `gate` or `meta` is not a conformant provider at all, so
+        // there is nothing to gate on initialisation or pause state here.
         capability == symbol_short!("risk")
             || capability == symbol_short!("gate")
             || capability == symbol_short!("cgate")
@@ -364,6 +380,9 @@ impl ReferenceRiskRegistry {
     /// Sets the provider-wide confidence floor.
     pub fn set_global_min_confidence(env: Env, min_confidence: u32) -> Result<(), Error> {
         Self::require_admin_auth(&env)?;
+        if storage_paused(&env) {
+            return Err(Error::ContractPaused);
+        }
         if min_confidence > 100 {
             return Err(Error::InvalidConfidence);
         }
@@ -401,6 +420,9 @@ impl ReferenceRiskRegistry {
         if !has_admin(env) || storage_paused(env) {
             return None;
         }
+        // Non-extending read: `get` (not `get` + `extend_ttl`) so a gate call
+        // cannot be used to pin state open or to charge the provider rent on a
+        // third party's behalf.
         env.storage().persistent().get(&DataKey::Score(subject.clone(), scope.clone()))
     }
 
@@ -416,6 +438,9 @@ impl ReferenceRiskRegistry {
     }
 
     fn require_admin_auth(env: &Env) -> Result<(), Error> {
+        // `NotInitialized` takes precedence over `Unauthorized`: before
+        // `initialize` there is no admin to be unauthorised relative to, and a
+        // caller must be able to tell "not wired yet" from "wrong key".
         let admin: Address =
             env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)?;
         admin.require_auth();

@@ -178,6 +178,17 @@ time-to-detection, exposure window, false-block rate and attacker gains.
 - A documented example evaluating a real parameter change.
 - Findings that reveal weaknesses are filed as separate issues with references.
 
+> **Claim audit note (see `docs/performance-claim-audit.md`).** The three claims
+> above — determinism with recorded seeds, the golden report test, and the
+> "at least three canned scenarios plus one defence comparison" count — were
+> re-verified against a fresh simulator run. All three still hold as written.
+> The determinism claim is scoped to a fixed seed *and* a fixed toolchain: the
+> golden report test pins the baseline output, so a toolchain or detection
+> pipeline change that alters the report is caught in CI rather than silently
+> invalidating this claim. If the canned-scenario count ever drops below three
+> (or the defence comparison is removed), this section must be updated in the
+> same change.
+
 ### Documented example: evaluating a real parameter change
 
 To evaluate a proposed change, run the simulator twice with the same seed —
@@ -188,9 +199,30 @@ carry trade (scenario 4 above) at the cost of a higher false-block rate for
 honest traders. The golden report test pins the baseline output so any drift in
 the detection pipeline or gate logic is caught in CI.
 
+> **Claim audit note (see `docs/performance-claim-audit.md`).** The directional
+> claim above ("should reduce the exposure window ... at the cost of a higher
+> false-block rate") is a *relative* claim, not a stated figure, and was
+> re-verified against a fresh baseline-vs-hardened run: the direction holds.
+> It is deliberately left unquantified here because the absolute numbers are
+> pinned in the golden report, not in this prose. **Flagged for maintainer
+> review:** the trade-off is asserted as a design justification for the
+> hardened config, but this document does not state the magnitude of the
+> false-block-rate increase. If a future run shows the exposure-window
+> reduction is smaller than the false-block-rate cost, the recommendation in
+> "Recommended integration posture" to prefer non-zero `finality_buffer` would
+> need revisiting rather than the number being silently adjusted.
+
 ## Compatibility impact
 
 - No existing gate ABI changed
 - The new tests only document and lock in fail-closed timing semantics
 - The simulator is tooling only and does not alter the public ABI, storage
   layout, events or error enum
+
+## Performance-claim maintenance
+
+The specific, falsifiable claims in this document (simulator determinism, the
+canned-scenario count, and the baseline-vs-hardened direction) are re-verified
+periodically as part of the release checklist, not just once. See the
+"Re-verify documented performance claims" item in the release process and the
+audit report at `docs/performance-claim-audit.md`.

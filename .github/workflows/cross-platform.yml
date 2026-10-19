@@ -38,3 +38,110 @@ jobs:
         run: cargo test --locked -p replay -p recovery -p schema-gen -p invocation-fuzzer
       - name: WASM builds (not byte-reproducible off Linux)
         run: cargo build --locked --target wasm32-unknown-unknown --release -p ledgerlens-score
+
+  # Issue #1465: prove the incident evidence bundle hash is stable across
+  # materially different host operating systems and filesystem orderings.
+  # Each platform generates a bundle from the same fixture input, uploads the
+  # resulting hash and full contents, and a final job compares them
+  # byte-for-byte and fails on any mismatch.
+  bundle-determinism:
+    name: bundle determinism (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.81.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build replay tool
+        run: cargo build --locked -p replay
+      - name: Generate evidence bundle from fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cargo run --locked -q -p replay -- \
+            bundle \
+            --input tests/fixtures/replay/bundle-input \
+            --out artifacts/bundle
+      - name: Record bundle hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --locked -q -p replay -- \
+            bundle-hash \
+            --bundle artifacts/bundle \
+            > artifacts/bundle.hash
+          cat artifacts/bundle.hash
+      - name: Upload bundle artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.os }}
+          path: artifacts/
+          if-no-files-found: error
+
+  bundle-determinism-compare:
+    name: bundle determinism (compare)
+    needs: bundle-determinism
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Linux bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: bundle-ubuntu-latest
+          path: bundles/linux
+      - name: Download Windows bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: bundle-windows-latest
+          path: bundles/windows
+      - name: Compare bundle hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          linux_hash="$(tr -d '\r\n' < bundles/linux/bundle.hash)"
+          windows_hash="$(tr -d '\r\n' < bundles/windows/bundle.hash)"
+          echo "linux:   ${linux_hash}"
+          echo "windows: ${windows_hash}"
+          if [ -z "${linux_hash}" ] || [ -z "${windows_hash}" ]; then
+            echo "::error::empty bundle hash produced on at least one platform"
+            exit 1
+          fi
+          if [ "${linux_hash}" != "${windows_hash}" ]; then
+            echo "::error::bundle hash differs across platforms (platform-dependent regression)"
+            exit 1
+          fi
+      - name: Compare bundle contents byte-for-byte
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! diff -r --no-dereference bundles/linux/bundle bundles/windows/bundle; then
+            echo "::error::bundle contents differ across platforms"
+            exit 1
+          fi
+      - name: Seeded platform-dependent regression check
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Seed a platform-dependent variation (CRLF line endings and a
+          # backslash path separator) into a copy of the Linux bundle and
+          # confirm the comparison logic detects it. This guards against the
+          # comparison silently passing on a real regression.
+          rm -rf seeded
+          cp -r bundles/linux/bundle seeded
+          target="$(find seeded -type f | sort | head -n 1)"
+          if [ -z "${target}" ]; then
+            echo "::error::no files found in bundle to seed regression"
+            exit 1
+          fi
+          printf 'seeded\\path\r\n' >> "${target}"
+          if diff -r --no-dereference bundles/linux/bundle seeded >/dev/null 2>&1; then
+            echo "::error::seeded platform-dependent regression was not detected"
+            exit 1
+          fi
+          echo "seeded regression correctly detected"

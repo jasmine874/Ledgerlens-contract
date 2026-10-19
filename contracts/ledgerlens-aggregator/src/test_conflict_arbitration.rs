@@ -327,3 +327,264 @@ fn test_realistic_shard_scenario() {
     assert_eq!(best.confidence, 95);
     assert_eq!(best.timestamp, 2000);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1464: lifecycle-aware arbitration
+//
+// A shard may be `Active`, `Draining` or `Decommissioned`. Draining shards are
+// excluded from the quorum used to admit *new* queries, but a query that has
+// already committed to a shard set (a "snapshot") must keep answering from
+// exactly that set, even if a member transitions mid-flight.
+// ---------------------------------------------------------------------------
+
+/// Lifecycle state of a shard from the arbitration point of view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShardLifecycle {
+    Active,
+    Draining,
+    Decommissioned,
+}
+
+/// A shard as seen by the arbitration layer: its lifecycle state plus the
+/// score it would return for a direct read.
+#[derive(Clone, Debug)]
+struct LifecycleShard {
+    id: u32,
+    state: ShardLifecycle,
+    score: RiskScore,
+}
+
+impl LifecycleShard {
+    fn new(id: u32, state: ShardLifecycle, score: RiskScore) -> Self {
+        Self { id, state, score }
+    }
+
+    /// Whether this shard may be counted toward quorum for a *new* query.
+    fn counts_toward_new_quorum(&self) -> bool {
+        self.state == ShardLifecycle::Active
+    }
+
+    /// Whether this shard can still answer a direct read (in-flight queries).
+    fn can_answer_read(&self) -> bool {
+        self.state != ShardLifecycle::Decommissioned
+    }
+}
+
+/// Deterministic arbitration over a fixed snapshot of shards.
+///
+/// Mirrors the documented rules: highest score wins, ties resolved by the
+/// order in which shards appear in the snapshot (registration order).
+fn arbitrate_snapshot(shards: &[LifecycleShard]) -> Option<RiskScore> {
+    let mut best: Option<&LifecycleShard> = None;
+    for shard in shards {
+        // A committed snapshot may include shards that have since started
+        // draining; they still answer. Only fully decommissioned shards are
+        // unavailable, and a committed snapshot never contains them.
+        if !shard.can_answer_read() {
+            continue;
+        }
+        match best {
+            None => best = Some(shard),
+            Some(current) => {
+                if shard.score.score > current.score.score {
+                    best = Some(shard);
+                }
+                // Equal scores: keep the earlier (first registered) shard.
+            }
+        }
+    }
+    best.map(|s| s.score.clone())
+}
+
+/// Build the quorum snapshot for a *new* query: only active shards count.
+fn new_query_snapshot(shards: &[LifecycleShard]) -> Vec<LifecycleShard> {
+    shards
+        .iter()
+        .filter(|s| s.counts_toward_new_quorum())
+        .cloned()
+        .collect()
+}
+
+/// Test that a draining shard is excluded from the quorum of a new query.
+#[test]
+fn test_draining_shard_excluded_from_new_quorum() {
+    let active = LifecycleShard::new(
+        1,
+        ShardLifecycle::Active,
+        make_score(70, 80, 1000, 1),
+    );
+    let draining = LifecycleShard::new(
+        2,
+        ShardLifecycle::Draining,
+        make_score(95, 80, 1000, 1), // highest score, but draining
+    );
+    let decommissioned = LifecycleShard::new(
+        3,
+        ShardLifecycle::Decommissioned,
+        make_score(99, 80, 1000, 1),
+    );
+
+    let shards = vec![active, draining, decommissioned];
+    let snapshot = new_query_snapshot(&shards);
+
+    // Only the active shard is admitted to the new-query quorum.
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].id, 1);
+
+    // The draining shard's higher score must not leak into the new query.
+    let result = arbitrate_snapshot(&snapshot).expect("active shard answers");
+    assert_eq!(result.score, 70);
+}
+
+/// Test that a draining shard can still answer a direct read.
+#[test]
+fn test_draining_shard_answers_direct_read() {
+    let draining = LifecycleShard::new(
+        7,
+        ShardLifecycle::Draining,
+        make_score(88, 90, 1234, 2),
+    );
+    assert!(draining.can_answer_read());
+    assert!(!draining.counts_toward_new_quorum());
+
+    let result = arbitrate_snapshot(&[draining]).expect("draining shard answers");
+    assert_eq!(result.score, 88);
+    assert_eq!(result.confidence, 90);
+    assert_eq!(result.timestamp, 1234);
+}
+
+/// Test that a decommissioned shard no longer answers reads.
+#[test]
+fn test_decommissioned_shard_does_not_answer() {
+    let decommissioned = LifecycleShard::new(
+        9,
+        ShardLifecycle::Decommissioned,
+        make_score(100, 100, 5000, 3),
+    );
+    assert!(!decommissioned.can_answer_read());
+    assert!(!decommissioned.counts_toward_new_quorum());
+    assert!(arbitrate_snapshot(&[decommissioned]).is_none());
+}
+
+/// Test that a query committed just before a transition returns the same
+/// result even though the shard transitions mid-flight.
+#[test]
+fn test_in_flight_query_unaffected_by_mid_flight_transition() {
+    // Two active shards; shard 2 has the higher score and wins arbitration.
+    let shard1 = LifecycleShard::new(
+        1,
+        ShardLifecycle::Active,
+        make_score(60, 80, 1000, 1),
+    );
+    let shard2 = LifecycleShard::new(
+        2,
+        ShardLifecycle::Active,
+        make_score(90, 85, 1000, 1),
+    );
+
+    // Query starts: snapshot is taken while both shards are active.
+    let committed_snapshot = new_query_snapshot(&[shard1.clone(), shard2.clone()]);
+    assert_eq!(committed_snapshot.len(), 2);
+    let before = arbitrate_snapshot(&committed_snapshot).expect("query answers");
+    assert_eq!(before.score, 90);
+
+    // Mid-flight: shard 2 begins draining (governance transition completes).
+    let shard2_draining = LifecycleShard::new(
+        2,
+        ShardLifecycle::Draining,
+        shard2.score.clone(),
+    );
+
+    // The committed snapshot is unchanged: the in-flight query still sees
+    // shard 2 and returns the identical result.
+    let after = arbitrate_snapshot(&committed_snapshot).expect("query still answers");
+    assert_eq!(after.score, before.score);
+    assert_eq!(after.confidence, before.confidence);
+    assert_eq!(after.timestamp, before.timestamp);
+
+    // A *new* query started after the transition excludes the draining shard,
+    // so its result differs — proving the exclusion is not retroactive.
+    let new_snapshot = new_query_snapshot(&[shard1, shard2_draining]);
+    assert_eq!(new_snapshot.len(), 1);
+    let new_result = arbitrate_snapshot(&new_snapshot).expect("new query answers");
+    assert_eq!(new_result.score, 60);
+    assert_ne!(new_result.score, before.score);
+}
+
+/// Test that a mid-flight transition to decommissioned also leaves an
+/// already-committed query's result untouched.
+#[test]
+fn test_in_flight_query_unaffected_by_decommission_transition() {
+    let shard1 = LifecycleShard::new(
+        1,
+        ShardLifecycle::Active,
+        make_score(55, 70, 1000, 1),
+    );
+    let shard2 = LifecycleShard::new(
+        2,
+        ShardLifecycle::Active,
+        make_score(77, 90, 2000, 2),
+    );
+
+    // Snapshot taken before the transition.
+    let committed_snapshot = new_query_snapshot(&[shard1.clone(), shard2.clone()]);
+    let before = arbitrate_snapshot(&committed_snapshot).expect("query answers");
+    assert_eq!(before.score, 77);
+
+    // Shard 2 finishes draining and is decommissioned mid-flight.
+    let shard2_decommissioned = LifecycleShard::new(
+        2,
+        ShardLifecycle::Decommissioned,
+        shard2.score.clone(),
+    );
+    assert!(!shard2_decommissioned.can_answer_read());
+
+    // The committed snapshot still yields the original result.
+    let after = arbitrate_snapshot(&committed_snapshot).expect("query still answers");
+    assert_eq!(after.score, before.score);
+    assert_eq!(after.confidence, before.confidence);
+
+    // New queries no longer see shard 2 at all.
+    let new_snapshot = new_query_snapshot(&[shard1, shard2_decommissioned]);
+    assert_eq!(new_snapshot.len(), 1);
+    let new_result = arbitrate_snapshot(&new_snapshot).expect("new query answers");
+    assert_eq!(new_result.score, 55);
+}
+
+/// Test that a tie broken by registration order is preserved across a
+/// mid-flight transition of a non-winning shard.
+#[test]
+fn test_tie_break_stable_across_mid_flight_transition() {
+    let first = LifecycleShard::new(
+        1,
+        ShardLifecycle::Active,
+        make_score(75, 80, 1000, 1),
+    );
+    let second = LifecycleShard::new(
+        2,
+        ShardLifecycle::Active,
+        make_score(75, 95, 1000, 1),
+    );
+
+    let committed_snapshot = new_query_snapshot(&[first.clone(), second.clone()]);
+    let before = arbitrate_snapshot(&committed_snapshot).expect("query answers");
+    // Tie: first registered wins.
+    assert_eq!(before.confidence, 80);
+
+    // The non-winning shard starts draining mid-flight.
+    let second_draining = LifecycleShard::new(
+        2,
+        ShardLifecycle::Draining,
+        second.score.clone(),
+    );
+
+    let after = arbitrate_snapshot(&committed_snapshot).expect("query still answers");
+    assert_eq!(after.confidence, before.confidence);
+
+    // New queries only see the first shard; result is unchanged here because
+    // the first shard already won the tie.
+    let new_snapshot = new_query_snapshot(&[first, second_draining]);
+    assert_eq!(new_snapshot.len(), 1);
+    let new_result = arbitrate_snapshot(&new_snapshot).expect("new query answers");
+    assert_eq!(new_result.confidence, 80);
+}

@@ -41,10 +41,36 @@ git pull origin main
 # 2. Verify CHANGELOG.md has an [Unreleased] section with the changes
 #    The release workflow extracts notes from this section.
 
-# 3. Create and push the tag
+# 3. Re-verify prose performance/resource-cost claims (see checklist below)
+
+# 4. Create and push the tag
 git tag contract-v1.2.3
 git push origin contract-v1.2.3
 ```
+
+### Pre-Release Checklist: Re-verify Prose Performance Claims
+
+The generated cost handbook is checked automatically in CI, but several documents
+make their own specific, falsifiable performance or resource-cost claims in prose
+as part of a design rationale. These are **not** automatically checked and can
+silently drift as the implementation evolves. Before tagging a release:
+
+- [ ] Re-measure the claims in `docs/score-math.md` (complexity bounds, per-score
+      cost figures) against a current build and confirm each still holds.
+- [ ] Re-measure the claims in `docs/liquidity-threat-model.md` (resource-cost and
+      order-of-magnitude claims used to justify the threat model) against a
+      current build.
+- [ ] Re-check any other prose performance claim flagged as load-bearing in
+      `docs/performance-claims-audit.md`.
+- [ ] For any claim that no longer holds, correct the figure **and** note in the
+      audit report whether the design decision it justified still stands; flag
+      for maintainer review if the justification is undermined.
+- [ ] Record the re-verification result (date, commit, outcome) in
+      `docs/performance-claims-audit.md` so the next release has a baseline.
+
+The audit report `docs/performance-claims-audit.md` lists every claim found, its
+verification method, and which claims are load-bearing for a design decision —
+consult it to know what must be re-checked each cycle.
 
 ### What Happens Next
 
@@ -255,6 +281,7 @@ The workflow requests minimal permissions:
 - `docs/reproducible-builds.md` — Local verification procedure and troubleshooting
 - `docs/deployment-manifests.md` — Manifest schema and toolchain drift checks
 - `docs/upgrade-guide.md` — Time-locked upgrade governance
+- `docs/performance-claims-audit.md` — Audit of prose performance/resource-cost claims and periodic re-verification record
 - `SECURITY.md` — Threat model and responsible disclosure
 - `CHANGELOG.md` — Keep a Changelog format (source for release notes)
 
@@ -269,4 +296,5 @@ The workflow requests minimal permissions:
 | View releases | `https://github.com/Ledger-Lenz/Ledgerlens-contract/releases` |
 | Verify artifact | `sha256sum --check ledgerlens_score.optimized.wasm.sha256` |
 | Local reproducibility check | See `docs/reproducible-builds.md` |
+| Re-verify prose performance claims | See `docs/performance-claims-audit.md` |
 | Delete bad tag | `git tag -d contract-vX.Y.Z && git push origin :refs/tags/contract-vX.Y.Z` |

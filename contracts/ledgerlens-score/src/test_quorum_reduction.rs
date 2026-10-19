@@ -10,7 +10,7 @@ use soroban_sdk::{
 
 use crate::{
     constants::DEFAULT_QUORUM_FAILURE_WINDOW_SECS, Error, LedgerLensScoreContract,
-    LedgerLensScoreContractClient,
+    LedgerLensScoreContractClient, ShardLifecycleState,
 };
 
 const START_TS: u64 = 1_700_000_000;
@@ -180,4 +180,138 @@ fn test_reduced_quorum_allows_submission() {
         &50, &false, &false, &env.ledger().timestamp(), &90, &1, &None
     );
     assert!(result.is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Shard lifecycle interaction with quorum calculations
+// ---------------------------------------------------------------------------
+
+/// Registers a shard and returns its identifier.
+fn register_shard<'a>(
+    env: &Env,
+    client: &LedgerLensScoreContractClient<'a>,
+    admin: &Address,
+) -> u32 {
+    let shard_id = client.get_shard_count();
+    client.register_shard(admin, &shard_id);
+    shard_id
+}
+
+/// Moves a shard into the draining state via the governed transition.
+fn begin_drain<'a>(
+    env: &Env,
+    client: &LedgerLensScoreContractClient<'a>,
+    admin: &Address,
+    shard_id: u32,
+) {
+    client.begin_shard_drain(admin, &shard_id);
+    assert_eq!(
+        client.get_shard_lifecycle_state(&shard_id),
+        ShardLifecycleState::Draining
+    );
+}
+
+#[test]
+fn test_draining_shard_excluded_from_quorum_for_new_queries() {
+    let (env, client, admin) = setup();
+    let shard_id = register_shard(&env, &client, &admin);
+
+    // While active, the shard counts toward the quorum for new queries.
+    assert_eq!(client.get_shard_lifecycle_state(&shard_id), ShardLifecycleState::Active);
+    assert_eq!(client.get_active_shard_count_for_quorum(), 1);
+
+    begin_drain(&env, &client, &admin, shard_id);
+
+    // Once draining, the shard no longer counts toward quorum for new queries.
+    assert_eq!(client.get_active_shard_count_for_quorum(), 0);
+}
+
+#[test]
+fn test_draining_shard_still_answers_direct_reads() {
+    let (env, client, admin) = setup();
+    let shard_id = register_shard(&env, &client, &admin);
+    let wallet = Address::generate(&env);
+    let pair = symbol_short!("XLM_USDC");
+
+    client.submit_score(
+        &Vec::new(&env),
+        &wallet,
+        &pair,
+        &50,
+        &false,
+        &false,
+        &START_TS,
+        &90,
+        &1,
+        &None,
+    );
+
+    begin_drain(&env, &client, &admin, shard_id);
+
+    // The shard's data is not removed and direct reads still resolve.
+    assert_eq!(client.get_score(&wallet, &pair), Some(50));
+}
+
+#[test]
+fn test_in_flight_query_unaffected_by_mid_flight_drain_transition() {
+    let (env, client, admin) = setup();
+    let shard_id = register_shard(&env, &client, &admin);
+    let wallet = Address::generate(&env);
+    let pair = symbol_short!("XLM_USDC");
+
+    client.submit_score(
+        &Vec::new(&env),
+        &wallet,
+        &pair,
+        &50,
+        &false,
+        &false,
+        &START_TS,
+        &90,
+        &1,
+        &None,
+    );
+
+    // A query starts while the shard is still active and commits to including it.
+    let query_id = client.begin_query(&wallet, &pair);
+    let committed_shards = client.get_query_shards(&query_id);
+    assert!(committed_shards.contains(&shard_id));
+
+    // The shard transitions to draining while the query is still in flight.
+    begin_drain(&env, &client, &admin, shard_id);
+
+    // The in-flight query's committed shard set is unchanged by the transition.
+    assert_eq!(client.get_query_shards(&query_id), committed_shards);
+
+    // And its result is unaffected: the shard still answers for this query.
+    let result = client.resolve_query(&query_id);
+    assert_eq!(result, Some(50));
+}
+
+#[test]
+fn test_new_query_after_drain_excludes_shard() {
+    let (env, client, admin) = setup();
+    let shard_id = register_shard(&env, &client, &admin);
+    let wallet = Address::generate(&env);
+    let pair = symbol_short!("XLM_USDC");
+
+    client.submit_score(
+        &Vec::new(&env),
+        &wallet,
+        &pair,
+        &50,
+        &false,
+        &false,
+        &START_TS,
+        &90,
+        &1,
+        &None,
+    );
+
+    begin_drain(&env, &client, &admin, shard_id);
+
+    // A query started after the transition does not commit to the draining shard.
+    let query_id = client.begin_query(&wallet, &pair);
+    let committed_shards = client.get_query_shards(&query_id);
+    assert!(!committed_shards.contains(&shard_id));
 }
